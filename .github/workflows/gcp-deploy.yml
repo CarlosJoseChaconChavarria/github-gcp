@@ -1,0 +1,82 @@
+name: Deploy GCP VPC
+
+# workflow_dispatch = manual trigger only.
+# Prevents a new VPC from being created on every git push.
+# Students click "Run workflow" in the Actions tab intentionally.
+on:
+  workflow_dispatch:
+
+env:
+  # Values come from GitHub Actions repository variables — nothing is hardcoded.
+  # Set these in: Settings → Secrets and variables → Actions → Variables tab
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+
+permissions:
+  # id-token: write is REQUIRED for OIDC.
+  # Allows the workflow to request a short-lived JWT token from GitHub.
+  # Without this, the authentication step silently fails.
+  id-token: write
+  # contents: read allows the workflow to check out the repository code.
+  contents: read
+
+jobs:
+  deploy-vpc:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the repo so the runner has access to all files.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Authenticate to GCP using Workload Identity Federation (OIDC).
+      # This action handles the full token exchange:
+      #   1. Requests a JWT from GitHub (needs id-token: write above)
+      #   2. Sends the JWT to GCP Security Token Service
+      #   3. GCP validates against the Workload Identity Pool
+      #   4. GCP issues short-lived credentials to impersonate the SA
+      # No JSON keys. No secrets. Credentials expire when the job ends.
+      - name: Authenticate to GCP (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          # Full resource path of the OIDC provider inside the pool.
+          # Format: projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL/providers/PROVIDER
+          workload_identity_provider: "projects/${{ vars.GCP_PROJECT_NUMBER }}/locations/global/workloadIdentityPools/${{ vars.GCP_POOL_NAME }}/providers/${{ vars.GCP_POOL_NAME }}-provider"
+          # The Service Account the workflow will impersonate.
+          service_account: "${{ vars.GCP_SA_NAME }}@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com"
+
+      # Install and configure the gcloud CLI on the runner.
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      # Verify the identity assumed by the workflow.
+      # Should print the Service Account email — confirms OIDC worked.
+      - name: Verify identity
+        run: gcloud auth list
+
+      # Create a custom VPC network.
+      # --subnet-mode=custom = no auto subnets (unlike AWS default VPCs).
+      # Equivalent to: aws ec2 create-vpc
+      - name: Create VPC
+        run: |
+          gcloud compute networks create vpc-gh-created \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --subnet-mode=custom \
+            --description="VPC created by GitHub Actions"
+          echo "✅ Created VPC: vpc-gh-created"
+
+      # Create a subnet inside the VPC.
+      # --range is the CIDR block (10.0.1.0/24 = 256 addresses).
+      # Equivalent to: aws ec2 create-subnet
+      - name: Create Subnet
+        run: |
+          gcloud compute networks subnets create subnet-gh-created \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --network=vpc-gh-created \
+            --range=10.0.1.0/24 \
+            --region=${{ env.GCP_REGION }} \
+            --description="Subnet created by GitHub Actions"
+          echo "✅ Created Subnet: subnet-gh-created in ${{ env.GCP_REGION }}"
+
